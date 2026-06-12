@@ -17,7 +17,9 @@ from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   NORMAL, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, A_CRUISE_MAX_V, RISE_RATE, SMOOTH_DECEL_BP, \
   SMOOTH_DECEL_V, BRAKE_DEEPENING_JERK, BRAKE_RELEASE_JERK, ACCEL_RISE_JERK, SMOOTH_DECEL_LOOKAHEAD_T, \
-  MIN_SMOOTH_BRAKE_NEED, HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED
+  MIN_SMOOTH_BRAKE_NEED, HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, \
+  ONSET_JERK0, ONSET_JERK_GAIN, ONSET_GAP_SOFT, ONSET_GAP_GAIN, ONSET_JERK_MAX, ONSET_HANDBACK_JERK, \
+  SOFT_ONSET_MAX_BRAKE_NEED, SOFT_ONSET_MAX_INSTANT_ACCEL, SOFT_ONSET_REARM_FRAMES
 
 _ZERO_ACCEL_EPS = 1e-6
 
@@ -36,6 +38,11 @@ class AccelController:
     self._decel_target = 0.0
     self._smooth_active = False
     self._bypassed = False
+    # convex brake-onset shaper state
+    self._onset_latched = False # sticky: True once an onset goes firm -> no re-soften until sustained release
+    self._onset_release = 0     # consecutive non-deepening frames (sticky re-arm debounce)
+    self._soft_active = False   # True iff the convex shaper governed this frame's output (bypasses min(.,raw))
+    self._soft_episode = False  # True while a soft onset is open (incl. closing its gap) -> own deepening, no snap
     self._read_params()
 
   def _read_params(self) -> None:
@@ -65,6 +72,13 @@ class AccelController:
     raw_target_accel = float(raw_target_accel)
     self._brake_need = self._compute_brake_need(raw_target_accel, accel_trajectory, t_idxs)
     self._decel_target = 0.0
+    self._soft_active = False
+    # convex shaper runs ONLY when enabled and personality != NORMAL (off==stock, NORMAL==stock).
+    # Single source of truth: when it cannot run, hard-reset all shaper state so nothing leaks across
+    # a param toggle (SPORT->NORMAL / enable->disable) or a bypass interlude.
+    convex_on = self._enabled and self._personality != NORMAL
+    if not convex_on:
+      self._reset_onset()
 
     # disabled, reset, or blended/e2e braking: hand straight to the plan
     if reset or not self._enabled or (stock_brake and (raw_target_accel < 0.0 or self._brake_need >= MIN_SMOOTH_BRAKE_NEED)):
@@ -73,17 +87,22 @@ class AccelController:
 
     self._bypassed = self._emergency_bypass(raw_target_accel, should_stop)
     if self._bypassed:
+      self._reset_onset()
       return self._passthrough(raw_target_accel)
 
     if self._brake_need < MIN_SMOOTH_BRAKE_NEED:
       self._smooth_active = False
       slewed = self._slew(raw_target_accel)
+      if self._soft_active:
+        return self._finalize(slewed)
       return self._finalize(min(slewed, raw_target_accel) if raw_target_accel < 0.0 else slewed)
 
-    # front-load a gentle early brake, never weaker than the plan
+    # front-load a gentle early brake, never weaker than the plan (unless the convex onset is active)
     self._smooth_active = True
     self._decel_target = self.get_decel_target(self._brake_need)
     slewed = self._slew(min(raw_target_accel, self._decel_target))
+    if self._soft_active:
+      return self._finalize(slewed)
     return self._finalize(min(slewed, raw_target_accel))
 
   def _compute_brake_need(self, raw_target_accel: float, accel_trajectory: Sequence[float], t_idxs: Sequence[float]) -> float:
@@ -99,10 +118,72 @@ class AccelController:
 
   def _slew(self, target_accel: float) -> float:
     target_accel = float(target_accel)
-    if target_accel > self._last_target_accel:
+    p = self._personality
+    jmax = BRAKE_DEEPENING_JERK[p]
+    deepening = target_accel <= self._last_target_accel
+    if not deepening:
+      # genuine release / coast: close any soft episode, advance the re-arm debounce, unlatch after a
+      # sustained release.
+      self._soft_episode = False
+      self._onset_release += 1
+      if self._onset_release >= SOFT_ONSET_REARM_FRAMES:
+        self._onset_latched = False
       return self._slew_up(target_accel)
-    step = BRAKE_DEEPENING_JERK[self._personality] * DT_MDL
-    return self._clean_accel(max(target_accel, self._last_target_accel - step))
+    self._onset_release = 0
+    # NORMAL (and disabled, forced to NORMAL) -> stock constant-jerk linear deepening, byte-exact.
+    if p == NORMAL:
+      return self._clean_accel(max(target_accel, self._last_target_accel - jmax * DT_MDL))
+    return self._slew_convex(target_accel, jmax)
+
+  def _onset_soft_armed(self, target_accel: float) -> bool:
+    # Gentle non-emergency onset. Armed from the FIRST deepening tick (no brake_need lower gate, so the
+    # gentle bite lands on the actual onset, not after the plan has already deepened). Two upper gates
+    # keep it off firm/deep braking: the 3s-lookahead brake_need ceiling AND the instantaneous raw depth.
+    return (self._enabled and self._personality != NORMAL and
+            0.0 < self._brake_need < SOFT_ONSET_MAX_BRAKE_NEED and
+            target_accel > SOFT_ONSET_MAX_INSTANT_ACCEL)
+
+  def _slew_convex(self, target_accel: float, jmax: float) -> float:
+    # target_accel is the effective plan to track (raw, or min(raw, decel_target) on the smooth branch).
+    p = self._personality
+    last = self._last_target_accel
+    soft_armed = self._onset_soft_armed(target_accel)
+    armed = soft_armed and not self._onset_latched
+    gap = max(0.0, last - target_accel)   # m/s^2 currently shallower than the plan (last,target both <=0)
+    if not armed:
+      # entered the firm/deep zone: latch off any further (re)arming for this event.
+      if soft_armed:
+        self._onset_latched = True
+      # NEVER start softening a fresh firm brake.
+      if not (self._soft_episode and gap > _ZERO_ACCEL_EPS):
+        self._soft_episode = False
+        return self._clean_accel(max(target_accel, last - jmax * DT_MDL))   # stock; caller does min(.,raw)
+      # Plan left the gentle zone but a soft gap is still open: close it FAST (firm, jerk-limited so it
+      # is not a snap) so the output catches the plan before braking gets firm -> no late-brake lag.
+      out = max(last - ONSET_HANDBACK_JERK[p] * DT_MDL, target_accel)
+      if out <= target_accel + _ZERO_ACCEL_EPS:
+        self._soft_episode = False
+      self._soft_active = True
+      return self._clean_accel(out)
+    self._soft_episode = True
+    # Depth-proportional convex jerk: gentle ONSET_JERK0 at the bite (a~0), growing with current decel
+    # depth. da/dt = j0 + k*a integrates to a(t) = (j0/k)*(exp(k*t)-1), the exponential-growth profile.
+    jerk = ONSET_JERK0[p] + ONSET_JERK_GAIN[p] * abs(last)
+    # Instantaneous-gap catch-up (stateless): once realized lags the plan by more than ONSET_GAP_SOFT,
+    # add bounded jerk so the softening can't run away and the gap-close is never a snap; hard-capped at
+    # ONSET_JERK_MAX so even the catch (while still gentle/armed) is never a grab.
+    jerk = min(jerk + ONSET_GAP_GAIN[p] * max(0.0, gap - ONSET_GAP_SOFT[p]), ONSET_JERK_MAX[p])
+    out = max(last - jerk * DT_MDL, target_accel)   # never deeper than the plan -> only softer-or-equal
+    if out <= target_accel + _ZERO_ACCEL_EPS:       # gap closed -> episode complete
+      self._soft_episode = False
+    self._soft_active = True
+    return self._clean_accel(out)
+
+  def _reset_onset(self) -> None:
+    self._onset_latched = False
+    self._onset_release = 0
+    self._soft_active = False
+    self._soft_episode = False
 
   def _slew_up(self, target_accel: float) -> float:
     if self._last_target_accel < 0.0:
@@ -115,6 +196,7 @@ class AccelController:
 
   def _passthrough(self, target_accel: float) -> float:
     self._smooth_active = False
+    self._soft_active = False
     return self._finalize(target_accel)
 
   def _finalize(self, target_accel: float) -> float:

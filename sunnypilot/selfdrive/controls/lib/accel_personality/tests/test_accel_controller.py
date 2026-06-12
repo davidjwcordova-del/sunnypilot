@@ -11,9 +11,17 @@ import numpy as np
 import pytest
 
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_controller import AccelController
+from openpilot.common.realtime import DT_MDL
+from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_controller import AccelController as _AC  # noqa: F401
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   ECO, NORMAL, SPORT, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, RISE_RATE, \
-  STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, HARD_BRAKE_TARGET_ACCEL, AccelerationPersonality
+  STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, HARD_BRAKE_TARGET_ACCEL, AccelerationPersonality, \
+  BRAKE_DEEPENING_JERK, ONSET_JERK0, ONSET_GAP_SOFT, ONSET_HANDBACK_JERK
+
+# The convex onset brakes shallower than the plan during the bite, but the instantaneous-gap catch-up
+# bounds how far it can lag, and it converges to the plan. The integrated velocity deficit over an
+# armed brake stays under this conservative cap (no permanent offset; added stopping distance bounded).
+_ONSET_VDEBT_BOUND = {ECO: 0.40, SPORT: 0.35}
 
 T_IDXS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
 _EPS = 1e-6
@@ -96,23 +104,95 @@ def test_early_soft_braking_brakes_before_plan():
 
 @pytest.mark.parametrize("personality", [ECO, NORMAL, SPORT])
 def test_never_weaker_than_plan_sustained_closing(personality):
-  # never command less braking than the plan (route 000003da regression guard)
+  # NORMAL/off: strict never-weaker (route 000003da regression guard). ECO/SPORT: the convex onset may
+  # lag the plan during the bite, but the INTEGRATED velocity deficit vs the plan stays bounded. This
+  # sequence also crosses the -1.5 emergency bypass (bit-exact raw thereafter).
   ctrl = make_controller(personality=personality)
+  vdebt = 0.0
   for raw in [0.0, -0.2, -0.5, -0.9, -1.2, -1.5] + [-1.5] * 40:
     out = ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
-    assert out <= raw + _EPS
+    if personality == NORMAL:
+      assert out <= raw + _EPS
+    else:
+      vdebt = max(0.0, vdebt + (out - raw) * DT_MDL)
+      assert vdebt <= _ONSET_VDEBT_BOUND[personality]
 
 
 @pytest.mark.parametrize("personality", [ECO, NORMAL, SPORT])
 def test_never_weaker_random_walk(personality):
+  # NORMAL strict never-weaker; ECO/SPORT integrated velocity deficit stays bounded even under an
+  # unrate-limited random plan (the deficit can never run away).
   rng = np.random.default_rng(0)
   ctrl = make_controller(personality=personality)
+  vdebt = 0.0
   for _ in range(500):
     raw = float(rng.uniform(-1.9, 1.5))
     traj = flat_traj(raw - float(rng.uniform(0.0, 0.6)))
     out = ctrl.smooth_target_accel(raw, traj, T_IDXS, should_stop=False)
-    if raw < 0.0:
-      assert out <= raw + _EPS
+    if personality == NORMAL:
+      if raw < 0.0:
+        assert out <= raw + _EPS
+    else:
+      vdebt = max(0.0, vdebt + (out - raw) * DT_MDL)
+      assert vdebt <= _ONSET_VDEBT_BOUND[personality]
+
+
+def test_normal_brake_bit_exact_vs_legacy_slew():
+  # NORMAL must be byte-identical to the legacy constant-jerk slew + min(slewed,raw) on a deepening ramp.
+  ctrl = make_controller(personality=NORMAL)
+  jmax = BRAKE_DEEPENING_JERK[NORMAL]
+  last = 0.0
+  for raw in [0.0, -0.1, -0.3, -0.45, -0.6, -0.6, -0.6, -0.5, -0.3, 0.0, 0.5]:
+    out = ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
+    if raw <= last:               # deepening: legacy step-limited then min(.,raw)
+      legacy = min(max(raw, last - jmax * DT_MDL), raw) if raw < 0.0 else max(raw, last - jmax * DT_MDL)
+      assert out == pytest.approx(legacy, abs=_EPS)
+    last = out
+
+
+@pytest.mark.parametrize("personality", [ECO, SPORT])
+def test_convex_onset_gentle_bite(personality):
+  # At a real brake onset the plan deepens gradually, so the gap stays within ONSET_GAP_SOFT and the
+  # first deepening tick must use only the gentle initial jerk ONSET_JERK0 (the soft bite), NOT bite hard.
+  ctrl = make_controller(personality=personality)
+  ctrl.smooth_target_accel(0.0, flat_traj(0.0), T_IDXS, should_stop=False)   # seed last=0
+  raw = -0.5 * ONSET_GAP_SOFT[personality]   # within the gap budget -> gentle bite, no catch-up
+  out = ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
+  j_init = abs(out - 0.0) / DT_MDL           # realized first-tick jerk == ONSET_JERK0 (gentle bite)
+  assert j_init == pytest.approx(ONSET_JERK0[personality], abs=1e-6)
+  assert out > raw                           # softened: shallower than the plan, NOT passed through
+
+
+@pytest.mark.parametrize("personality", [ECO, SPORT])
+def test_convex_onset_velocity_deficit_bounded_and_converges(personality):
+  # Integrated velocity deficit vs plan over a sustained moderate brake stays bounded, and the controller
+  # CONVERGES to the plan (no permanent velocity offset -> added stopping distance is a bounded transient).
+  ctrl = make_controller(personality=personality)
+  vdebt = 0.0
+  last = 0.0
+  raw = -0.9                                          # armed (raw > SOFT_ONSET_MAX_INSTANT_ACCEL = -1.0)
+  for _ in range(500):
+    out = ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
+    vdebt = max(0.0, vdebt + (out - raw) * DT_MDL)   # accrue only shallower-than-plan deficit
+    last = out
+  assert vdebt <= _ONSET_VDEBT_BOUND[personality]
+  assert last == pytest.approx(raw, abs=1e-3)        # converged to the plan, no permanent offset
+
+
+@pytest.mark.parametrize("personality", [ECO, SPORT])
+def test_convex_onset_no_jerk_snap(personality):
+  # A gentle armed bite opens a soft gap; when the plan then deepens past the gentle zone the gap is
+  # closed by the FAST hand-back -- still jerk-limited, never a 1-frame snap to the plan. Max realized
+  # jerk anywhere on the convex path must not exceed the hand-back ceiling.
+  ctrl = make_controller(personality=personality)
+  ctrl.smooth_target_accel(0.0, flat_traj(0.0), T_IDXS, should_stop=False)
+  prev = 0.0
+  worst = 0.0
+  for raw in [-0.3] * 10 + [-0.9] * 40:          # gentle onset, then deepen past the gentle zone
+    out = ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
+    worst = max(worst, abs(out - prev) / DT_MDL)
+    prev = out
+  assert worst <= ONSET_HANDBACK_JERK[personality] + _EPS
 
 
 def test_hard_brake_bypass():

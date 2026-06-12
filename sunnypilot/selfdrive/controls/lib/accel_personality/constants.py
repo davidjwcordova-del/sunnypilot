@@ -41,3 +41,41 @@ SMOOTH_DECEL_LOOKAHEAD_T = 3.0
 MIN_SMOOTH_BRAKE_NEED = 0.5
 HARD_BRAKE_TARGET_ACCEL = -1.5
 HARD_BRAKE_NEED = 2.6
+
+# --- Convex brake-onset shaper (param-gated; ECO/SPORT only, NORMAL = stock passthrough) ---
+# The grabby bite is the raw MPC plan: stock deepening uses a CONSTANT jerk (integrates to a LINEAR
+# accel ramp) and min(slewed,raw) lets the deep raw plan win, so the bite passes through untouched.
+# Fix: jerk-limit the deepening with a DEPTH-PROPORTIONAL jerk
+#   jerk(a) = ONSET_JERK0 + ONSET_JERK_GAIN * abs(a_current),  capped at ONSET_JERK_MAX
+# At the bite (a~0) the jerk is ONSET_JERK0 (gentle); it grows with decel depth, so the decel magnitude
+# follows da/dt = j0 + k*a  =>  a(t) = (j0/k)*(exp(k*t) - 1) -- the exponential-growth reference. The
+# output is never deeper than the plan (only ever softer-or-equal during the bite) and converges to it.
+# No velocity-debt feedback: it carried stale state across closely-spaced stop-and-go brakes and
+# over-braked the next onset (verified). NORMAL omitted -> shaper never runs.
+ONSET_JERK0 = {ECO: 0.15, SPORT: 0.25}        # m/s^3  initial gentle jerk at the bite (target band 0.15-0.25)
+ONSET_JERK_GAIN = {ECO: 1.2, SPORT: 2.0}      # 1/s    depth-proportional growth rate k (convex; bigger -> faster)
+
+# Bounded softening: the gentle bite lags the plan (brakes shallower) at the very start. To keep the
+# softening modest (so it never feels like "no brakes"), an INSTANTANEOUS-gap catch-up adds jerk when
+# realized lags the plan by more than ONSET_GAP_SOFT, hard-capped at ONSET_JERK_MAX. This uses the
+# current accel gap only (no integrated state) so nothing carries across closely-spaced brakes. Steady
+# softening then settles near ONSET_GAP_SOFT; the hard cap keeps the catch from ever being a grab.
+ONSET_GAP_SOFT = {ECO: 0.30, SPORT: 0.25}     # m/s^2  tolerated shallower-than-plan gap before catch-up
+ONSET_GAP_GAIN = {ECO: 4.0, SPORT: 5.0}       # 1/s    extra jerk per m/s^2 of gap beyond ONSET_GAP_SOFT
+ONSET_JERK_MAX = {ECO: 1.4, SPORT: 1.8}       # m/s^3  hard ceiling on convex-path jerk while still armed/gentle
+# Fast hand-back: once the plan leaves the gentle zone (no longer armed) but a soft gap is still open,
+# close it at this FIRM jerk so the output catches the plan BEFORE braking gets firm -> no late-brake lag
+# into the [-1.5,-1.0] band. Jerk-limited (not a snap), and never deeper than the plan, so not a grab.
+ONSET_HANDBACK_JERK = {ECO: 3.0, SPORT: 4.0}  # m/s^3  gap-close rate when the plan has firmed past the gentle zone
+
+# Arm gates (conservative). Only shape genuinely gentle onsets; firm/deep onsets fall to the stock
+# never-weaker slew (they SHOULD bite). Two independent safety layers against late braking: (1) the
+# PREDICTIVE brake_need gate declines to start a gentle bite when a firmer brake is seen within 3s, so
+# we don't soften ahead of one; (2) the fast hand-back (ONSET_HANDBACK_JERK) closes any open soft gap
+# before the plan reaches firm braking. Together: 0 firm-band ([-1.5,-1.0]) lag on the verified windows.
+SOFT_ONSET_MAX_BRAKE_NEED = 0.9               # do NOT soften if a firmer brake is predicted within 3s
+SOFT_ONSET_MAX_INSTANT_ACCEL = -0.7           # m/s^2  stop softening (fast hand-back) once raw is this deep
+# Sticky re-arm: once an onset goes firm (instantaneously too deep) it latches OFF; require this many
+# consecutive released/flat frames before a NEW soft window may open, so lead/SnG jitter cannot re-arm
+# the bite every few hundred ms (flicker guard). Controller runs at the model rate (DT_MDL = 0.05 s).
+SOFT_ONSET_REARM_FRAMES = 10                  # frames (~0.5 s at 20 Hz model rate) of release before re-arm
