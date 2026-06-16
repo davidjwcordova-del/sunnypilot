@@ -16,15 +16,19 @@ PERSONALITY_MIN = min(AccelerationPersonality.schema.enumerants.values())
 PERSONALITY_MAX = max(AccelerationPersonality.schema.enumerants.values())
 
 # Accel ceiling. NORMAL is stock so a disabled controller (forced to NORMAL) is stock.
+# This is the POSITIVE-accel upper clip + its upward slew rate. It is the launch/cruise-accel side and
+# is independent of braking (which is the lower clip + the convex/SMOOTH_DECEL shaper) -- tuning it does
+# NOT change the gentle-brake goals. ECO launch (v=0) matches stock + stock rise rate so take-off from
+# a stop is prompt (no honking); only the 25/40 m/s cruise points stay gentle.
 A_CRUISE_MAX_BP = [0., 14., 25., 40.]
 STOCK_A_CRUISE_MAX_V = [1.6, 0.7, 0.2, 0.08]
 STOCK_RISE_RATE = 0.05
 A_CRUISE_MAX_V = {
-  ECO:    [1.20, 0.40, 0.13, 0.05],
+  ECO:    [1.60, 0.60, 0.13, 0.05],   # stock launch (v=0), gentle cruise (25/40)
   NORMAL: STOCK_A_CRUISE_MAX_V,
   SPORT:  [1.90, 1.30, 0.60, 0.25],
 }
-RISE_RATE = {ECO: 0.02, NORMAL: STOCK_RISE_RATE, SPORT: 0.06}
+RISE_RATE = {ECO: 0.05, NORMAL: STOCK_RISE_RATE, SPORT: 0.06}   # ECO rise = stock so launch ramps promptly
 
 # Early soft braking: predicted brake need (m/s^2) -> early decel target (m/s^2).
 SMOOTH_DECEL_BP = [0.0, 0.4, 0.8, 1.2, 1.6, 2.0, 2.4]

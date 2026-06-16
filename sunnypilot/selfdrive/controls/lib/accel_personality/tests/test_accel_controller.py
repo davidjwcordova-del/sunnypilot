@@ -84,14 +84,19 @@ def test_normal_matches_stock():
   assert ctrl.get_rise_rate() == STOCK_RISE_RATE
 
 
-def test_ceiling_ordering_eco_lt_normal_lt_sport():
+def test_ceiling_ordering_eco_le_normal_lt_sport():
+  # ECO launch (v=0) intentionally matches stock for prompt take-off; ECO is strictly gentler only at
+  # cruise speeds. So ECO <= NORMAL everywhere, strictly below at cruise; SPORT strictly above NORMAL.
   eco, normal, sport = (make_controller(personality=p) for p in (ECO, NORMAL, SPORT))
   for v in (0.0, 10.0, 25.0, 40.0):
-    assert eco.get_max_accel(v) < normal.get_max_accel(v) < sport.get_max_accel(v)
+    assert eco.get_max_accel(v) <= normal.get_max_accel(v) < sport.get_max_accel(v)
+  for v in (14.0, 25.0, 40.0):
+    assert eco.get_max_accel(v) < normal.get_max_accel(v)
 
 
 def test_rise_rate_ordering():
-  assert RISE_RATE[ECO] < RISE_RATE[NORMAL] < RISE_RATE[SPORT]
+  # ECO rise == stock (prompt launch ramp) by design; SPORT firmer than both.
+  assert RISE_RATE[ECO] <= RISE_RATE[NORMAL] < RISE_RATE[SPORT]
 
 
 def test_early_soft_braking_brakes_before_plan():
