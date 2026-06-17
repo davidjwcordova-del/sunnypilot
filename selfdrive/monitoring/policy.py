@@ -29,21 +29,21 @@ class DRIVER_MONITOR_SETTINGS:
     self._WHEELTOUCH_POLICY_ALERT_2_TIMEOUT = 24.
     self._WHEELTOUCH_POLICY_ALERT_3_TIMEOUT = 30.
     # https://cdn.euroncap.com/cars/assets/euro_ncap_protocol_safe_driving_driver_engagement_v11_a30e874152.pdf
-    self._VISION_POLICY_ALERT_1_TIMEOUT = 3.
-    self._VISION_POLICY_ALERT_2_TIMEOUT = 5.
-    self._VISION_POLICY_ALERT_3_TIMEOUT = 11.
+    self._VISION_POLICY_ALERT_1_TIMEOUT = 300.
+    self._VISION_POLICY_ALERT_2_TIMEOUT = 500.
+    self._VISION_POLICY_ALERT_3_TIMEOUT = 1100.
 
     self._TIMEOUT_RECOVERY_FACTOR_MAX = 5.
     self._TIMEOUT_RECOVERY_FACTOR_MIN = 1.25
 
-    self._MAX_TERMINAL_ALERTS = 3  # not allowed to engage after 3 terminal alerts
+    self._MAX_TERMINAL_ALERTS = 30  # not allowed to engage after 3 terminal alerts
     self._MAX_TERMINAL_DURATION = int(30 / DT_DMON)  # not allowed to engage after 30s of terminal alerts
 
     self._FACE_THRESHOLD = 0.7
     self._EYE_THRESHOLD = 0.65
     self._SG_THRESHOLD = 0.9
     self._BLINK_THRESHOLD = 0.865
-    self._PHONE_THRESH = 0.5
+    self._PHONE_THRESH = 10.5
     self._POSE_PITCH_THRESHOLD = 0.3133
     self._POSE_PITCH_THRESHOLD_SLACK = 0.3237
     self._POSE_PITCH_THRESHOLD_STRICT = self._POSE_PITCH_THRESHOLD
